@@ -311,6 +311,46 @@
   )
 )
 
+;; Calculate loyalty bonus based on user engagement
+(define-private (calculate-loyalty-bonus (staker principal))
+  (match (map-get? user-stats { user: staker })
+    stats (let ((loyalty-points (get loyalty-points stats)))
+      (if (> loyalty-points u1000)
+        u200 ;; 2% bonus for whales
+        (if (> loyalty-points u500)
+          u100 ;; 1% bonus for veterans
+          (if (> loyalty-points u100)
+            u50 ;; 0.5% bonus for regulars
+            u0
+          )
+        )
+      )
+    )
+    u0
+  )
+)
+
+;; Update user statistics and loyalty tracking
+(define-private (update-user-stats
+    (staker principal)
+    (amount uint)
+  )
+  (match (map-get? user-stats { user: staker })
+    prev-stats (map-set user-stats { user: staker } {
+      total-staked-ever: (+ (get total-staked-ever prev-stats) amount),
+      stake-count: (+ (get stake-count prev-stats) u1),
+      first-stake-block: (get first-stake-block prev-stats),
+      loyalty-points: (+ (get loyalty-points prev-stats) (/ amount u1000000)),
+    })
+    (map-set user-stats { user: staker } {
+      total-staked-ever: amount,
+      stake-count: u1,
+      first-stake-block: stacks-block-height,
+      loyalty-points: (/ amount u1000000),
+    })
+  )
+)
+
 ;; QUERY INTERFACE
 
 (define-read-only (get-stake-info (staker principal))
@@ -329,4 +369,31 @@
 
 (define-read-only (get-contract-owner)
   (var-get contract-owner)
+)
+
+;; REWARD CALCULATION ENGINE
+
+(define-read-only (calculate-rewards (staker principal))
+  (match (map-get? stakes { staker: staker })
+    stake-info (let (
+        (stake-amount (get amount stake-info))
+        (stake-duration (- stacks-block-height (get last-reward-claim stake-info)))
+        (user-tier (get tier stake-info))
+        (tier-info (unwrap! (map-get? reward-tiers { tier: user-tier }) u0))
+        (tier-multiplier (get reward-multiplier tier-info))
+        (base-reward (/ (* stake-amount (var-get reward-rate)) BASIS_POINTS))
+        (time-factor (/ stake-duration BLOCKS_PER_YEAR))
+        (tier-bonus (/ (* base-reward tier-multiplier) BASIS_POINTS))
+        (loyalty-bonus-rate (calculate-loyalty-bonus staker))
+        (loyalty-bonus (/ (* tier-bonus loyalty-bonus-rate) BASIS_POINTS))
+        (compound-bonus (if (get auto-compound stake-info)
+          (/ (* tier-bonus (var-get compound-bonus-rate)) BASIS_POINTS)
+          u0
+        ))
+        (total-reward (+ tier-bonus loyalty-bonus compound-bonus))
+      )
+      (/ (* total-reward time-factor) u1)
+    )
+    u0
+  )
 )
