@@ -96,7 +96,6 @@
   reward-multiplier: u10000, ;; 1x base rate
   name: "Bronze",
 }) 
-
 ;; Silver Tier - Committed Stakers
 (map-set reward-tiers { tier: u2 } {
   min-amount: u10000000, ;; 0.1 sBTC
@@ -104,7 +103,6 @@
   reward-multiplier: u12000, ;; 1.2x boost
   name: "Silver",
 }) 
-
 ;; Gold Tier - Serious Investors
 (map-set reward-tiers { tier: u3 } {
   min-amount: u100000000, ;; 1 sBTC
@@ -112,15 +110,13 @@
   reward-multiplier: u15000, ;; 1.5x boost
   name: "Gold",
 }) 
-
 ;; Platinum Tier - Whale Investors
 (map-set reward-tiers { tier: u4 } {
   min-amount: u1000000000, ;; 10 sBTC
   min-duration: u17280, ;; 120 days
   reward-multiplier: u20000, ;; 2x boost
   name: "Platinum",
-})
-
+}) 
 ;; PROTOCOL STATE VARIABLES
 
 ;; Core governance and configuration
@@ -280,6 +276,87 @@
   )
 )
 
+;; REWARD DISTRIBUTION
+
+(define-public (claim-rewards)
+  (let (
+      (stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (reward-amount (calculate-rewards tx-sender))
+    )
+    ;; Validate claim conditions
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (> reward-amount u0) ERR_NO_STAKE_FOUND)
+    (asserts! (<= reward-amount (var-get reward-pool)) ERR_NOT_ENOUGH_REWARDS)
+    ;; Process protocol fees
+    (let (
+        (protocol-fee (/ (* reward-amount (var-get protocol-fee-rate)) BASIS_POINTS))
+        (net-reward (- reward-amount protocol-fee))
+      )
+      ;; Update protocol accounting
+      (var-set reward-pool (- (var-get reward-pool) reward-amount))
+      (var-set protocol-fee-pool (+ (var-get protocol-fee-pool) protocol-fee))
+      (var-set total-rewards-distributed
+        (+ (var-get total-rewards-distributed) reward-amount)
+      )
+      ;; Handle reward distribution based on auto-compound preference
+      (if (get auto-compound stake-info)
+        (begin
+          ;; Compound rewards into stake position
+          (map-set stakes { staker: tx-sender } {
+            amount: (+ (get amount stake-info) net-reward),
+            staked-at: (get staked-at stake-info),
+            last-reward-claim: stacks-block-height,
+            tier: (get tier stake-info),
+            auto-compound: true,
+          })
+          ;; Update compound tracking
+          (match (map-get? rewards-claimed { staker: tx-sender })
+            prev-claimed (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: (get total-claimed prev-claimed),
+              last-claim-block: stacks-block-height,
+              compound-rewards: (+ (get compound-rewards prev-claimed) net-reward),
+            })
+            (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: u0,
+              last-claim-block: stacks-block-height,
+              compound-rewards: net-reward,
+            })
+          )
+          (var-set total-staked (+ (var-get total-staked) net-reward))
+        )
+        (begin
+          ;; Direct reward payment to staker
+          (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+            transfer net-reward (as-contract tx-sender) tx-sender none
+          )))
+          ;; Reset reward accumulation
+          (map-set stakes { staker: tx-sender } {
+            amount: (get amount stake-info),
+            staked-at: (get staked-at stake-info),
+            last-reward-claim: stacks-block-height,
+            tier: (get tier stake-info),
+            auto-compound: false,
+          })
+          ;; Update claim history
+          (match (map-get? rewards-claimed { staker: tx-sender })
+            prev-claimed (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: (+ (get total-claimed prev-claimed) net-reward),
+              last-claim-block: stacks-block-height,
+              compound-rewards: (get compound-rewards prev-claimed),
+            })
+            (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: net-reward,
+              last-claim-block: stacks-block-height,
+              compound-rewards: u0,
+            })
+          )
+        )
+      )
+    )
+    (ok true)
+  )
+)
+
 ;; UTILITY FUNCTIONS
 
 ;; Determine user tier based on stake amount and duration
@@ -365,6 +442,33 @@
   (var-get min-stake-period)
 )
 
+(define-read-only (get-rewards-claimed (staker principal))
+  (map-get? rewards-claimed { staker: staker })
+)
+
+(define-read-only (get-user-stats (staker principal))
+  (map-get? user-stats { user: staker })
+)
+
+(define-read-only (get-tier-info (tier uint))
+  (map-get? reward-tiers { tier: tier })
+)
+
+(define-read-only (get-reward-rate)
+  (var-get reward-rate)
+)
+
+(define-read-only (get-reward-pool)
+  (var-get reward-pool)
+)
+
+(define-read-only (get-current-apy)
+  (let ((base-rate (var-get reward-rate)))
+    (/ (* base-rate u100) u100)
+    ;; Convert basis points to percentage
+  )
+)
+
 ;; ADMINISTRATIVE FUNCTIONS
 
 (define-read-only (get-contract-owner)
@@ -393,6 +497,31 @@
         (total-reward (+ tier-bonus loyalty-bonus compound-bonus))
       )
       (/ (* total-reward time-factor) u1)
+    )
+    u0
+  )
+)
+
+;; ANALYTICS & PROJECTIONS
+
+(define-read-only (estimate-rewards
+    (staker principal)
+    (blocks-ahead uint)
+  )
+  (match (map-get? stakes { staker: staker })
+    stake-info (let (
+        (stake-amount (get amount stake-info))
+        (projected-duration (+ (- stacks-block-height (get last-reward-claim stake-info))
+          blocks-ahead
+        ))
+        (user-tier (get tier stake-info))
+        (tier-info (unwrap! (map-get? reward-tiers { tier: user-tier }) u0))
+        (tier-multiplier (get reward-multiplier tier-info))
+        (base-reward (/ (* stake-amount (var-get reward-rate)) BASIS_POINTS))
+        (time-factor (/ projected-duration BLOCKS_PER_YEAR))
+        (tier-bonus (/ (* base-reward tier-multiplier) BASIS_POINTS))
+      )
+      (/ (* tier-bonus time-factor) u1)
     )
     u0
   )
