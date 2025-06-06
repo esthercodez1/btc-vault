@@ -65,3 +65,161 @@
 
 ;; Economic parameters
 (define-data-var max-individual-stake uint u100000000000) ;; 1000 sBTC per user limit
+
+;; CORE STAKING MECHANICS
+
+(define-public (stake
+    (amount uint)
+    (auto-compound bool)
+  )
+  (begin
+    ;; Validate contract state and parameters
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (>= amount MIN_STAKE_AMOUNT) ERR_INVALID_AMOUNT)
+    ;; Enforce individual stake limits
+    (match (map-get? stakes { staker: tx-sender })
+      prev-stake (asserts!
+        (<= (+ amount (get amount prev-stake)) (var-get max-individual-stake))
+        ERR_INVALID_AMOUNT
+      )
+      (asserts! (<= amount (var-get max-individual-stake)) ERR_INVALID_AMOUNT)
+    )
+    ;; Transfer sBTC to contract custody
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount tx-sender (as-contract tx-sender) none
+    ))
+    ;; Configure stake with appropriate tier
+    (let ((user-tier (get-user-tier tx-sender amount u0)))
+      (match (map-get? stakes { staker: tx-sender })
+        prev-stake
+        (begin
+          ;; Claim existing rewards before updating stake
+          (try! (claim-rewards))
+          (map-set stakes { staker: tx-sender } {
+            amount: (+ amount (get amount prev-stake)),
+            staked-at: stacks-block-height,
+            last-reward-claim: stacks-block-height,
+            tier: user-tier,
+            auto-compound: auto-compound,
+          })
+        )
+        ;; Create new stake position
+        (map-set stakes { staker: tx-sender } {
+          amount: amount,
+          staked-at: stacks-block-height,
+          last-reward-claim: stacks-block-height,
+          tier: user-tier,
+          auto-compound: auto-compound,
+        })
+      )
+    )
+    ;; Update protocol metrics
+    (var-set total-staked (+ (var-get total-staked) amount))
+    (update-user-stats tx-sender amount)
+    (ok true)
+  )
+)
+
+;; UNSTAKING MECHANICS
+
+(define-public (unstake (amount uint))
+  (let (
+      (stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (staked-amount (get amount stake-info))
+      (staked-at (get staked-at stake-info))
+      (stake-duration (- stacks-block-height staked-at))
+    )
+    ;; Validate unstaking conditions
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (> amount u0) ERR_ZERO_STAKE)
+    (asserts! (>= staked-amount amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (>= stake-duration (var-get min-stake-period))
+      ERR_TOO_EARLY_TO_UNSTAKE
+    )
+    ;; Enforce cooldown period
+    (match (map-get? rewards-claimed { staker: tx-sender })
+      claim-info (asserts!
+        (>= (- stacks-block-height (get last-claim-block claim-info))
+          (var-get cooldown-period)
+        )
+        ERR_COOLDOWN_PERIOD
+      )
+      true
+    )
+    ;; Process pending rewards before unstaking
+    (if (> (calculate-rewards tx-sender) u0)
+      (try! (claim-rewards))
+      true
+    )
+    ;; Update or remove stake position
+    (if (> staked-amount amount)
+      (map-set stakes { staker: tx-sender } {
+        amount: (- staked-amount amount),
+        staked-at: stacks-block-height,
+        last-reward-claim: stacks-block-height,
+        tier: (get tier stake-info),
+        auto-compound: (get auto-compound stake-info),
+      })
+      (map-delete stakes { staker: tx-sender })
+    )
+    ;; Update protocol metrics
+    (var-set total-staked (- (var-get total-staked) amount))
+    ;; Return sBTC to staker
+    (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount (as-contract tx-sender) tx-sender none
+    )))
+    (ok true)
+  )
+)
+
+;; EMERGENCY PROCEDURES
+
+(define-public (emergency-withdraw)
+  (let ((stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND)))
+    (asserts! (var-get emergency-withdraw-enabled) ERR_NOT_AUTHORIZED)
+    (let ((amount (get amount stake-info)))
+      ;; Emergency exit without rewards
+      (map-delete stakes { staker: tx-sender })
+      (var-set total-staked (- (var-get total-staked) amount))
+      (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+        transfer amount (as-contract tx-sender) tx-sender none
+      )))
+      (ok true)
+    )
+  )
+)
+
+;; USER PREFERENCE MANAGEMENT
+
+(define-public (toggle-auto-compound)
+  (let ((stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND)))
+    (map-set stakes { staker: tx-sender } {
+      amount: (get amount stake-info),
+      staked-at: (get staked-at stake-info),
+      last-reward-claim: (get last-reward-claim stake-info),
+      tier: (get tier stake-info),
+      auto-compound: (not (get auto-compound stake-info)),
+    })
+    (ok (not (get auto-compound stake-info)))
+  )
+)
+
+;; QUERY INTERFACE
+
+(define-read-only (get-stake-info (staker principal))
+  (map-get? stakes { staker: staker })
+)
+
+(define-read-only (get-total-staked)
+  (var-get total-staked)
+)
+
+(define-read-only (get-min-stake-period)
+  (var-get min-stake-period)
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+(define-read-only (get-contract-owner)
+  (var-get contract-owner)
+)
