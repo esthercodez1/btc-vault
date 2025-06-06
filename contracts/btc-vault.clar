@@ -23,6 +23,7 @@
 (define-constant BLOCKS_PER_DAY u144)
 (define-constant BLOCKS_PER_YEAR u52560)
 (define-constant BASIS_POINTS u10000)
+(define-constant MAX_REWARD_RATE u2000) ;; 20% maximum annual yield
 (define-constant MIN_STAKE_AMOUNT u1000000) ;; 0.01 sBTC minimum threshold
 
 ;; ERROR DEFINITIONS
@@ -40,6 +41,7 @@
 (define-constant ERR_COOLDOWN_PERIOD (err u110))
 (define-constant ERR_TIER_NOT_FOUND (err u111))
 (define-constant ERR_INVALID_TIER (err u112))
+(define-constant ERR_SLASHING_CONDITIONS_MET (err u113))
 
 ;; DATA STRUCTURES
 
@@ -87,6 +89,27 @@
   }
 )
 
+;; PROTOCOL STATE VARIABLES
+
+;; Core governance and configuration
+(define-data-var contract-owner principal tx-sender)
+(define-data-var reward-rate uint u500) ;; 5% base annual rate
+(define-data-var reward-pool uint u0)
+(define-data-var min-stake-period uint u1440) ;; ~10 days minimum lock
+(define-data-var total-staked uint u0)
+
+;; Security and emergency controls
+(define-data-var contract-paused bool false)
+(define-data-var emergency-withdraw-enabled bool false)
+(define-data-var cooldown-period uint u144) ;; 1 day cooldown
+
+;; Economic parameters
+(define-data-var total-rewards-distributed uint u0)
+(define-data-var protocol-fee-rate uint u100) ;; 1% protocol fee
+(define-data-var protocol-fee-pool uint u0)
+(define-data-var compound-bonus-rate uint u50) ;; 0.5% auto-compound bonus
+(define-data-var max-individual-stake uint u100000000000) ;; 1000 sBTC per user limit
+
 ;; TIER SYSTEM INITIALIZATION
 
 ;; Bronze Tier - Entry Level
@@ -117,26 +140,164 @@
   reward-multiplier: u20000, ;; 2x boost
   name: "Platinum",
 }) 
-;; PROTOCOL STATE VARIABLES
+;; ADMINISTRATIVE FUNCTIONS
 
-;; Core governance and configuration
-(define-data-var contract-owner principal tx-sender)
-(define-data-var min-stake-period uint u1440) ;; ~10 days minimum lock
-(define-data-var total-staked uint u0)
-(define-data-var reward-rate uint u500) ;; 5% base annual rate
-(define-data-var reward-pool uint u0)
+(define-read-only (get-contract-owner)
+  (var-get contract-owner)
+)
 
-;; Security and emergency controls
-(define-data-var contract-paused bool false)
-(define-data-var emergency-withdraw-enabled bool false)
-(define-data-var cooldown-period uint u144) ;; 1 day cooldown
+(define-read-only (get-contract-version)
+  CONTRACT_VERSION
+)
 
-;; Economic parameters
-(define-data-var total-rewards-distributed uint u0)
-(define-data-var protocol-fee-rate uint u100) ;; 1% protocol fee
-(define-data-var protocol-fee-pool uint u0)
-(define-data-var compound-bonus-rate uint u50) ;; 0.5% auto-compound bonus
-(define-data-var max-individual-stake uint u100000000000) ;; 1000 sBTC per user limit
+(define-public (set-contract-owner (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq new-owner (var-get contract-owner))) (ok true))
+    (ok (var-set contract-owner new-owner))
+  )
+)
+
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (ok (var-set contract-paused true))
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (ok (var-set contract-paused false))
+  )
+)
+
+(define-public (enable-emergency-withdraw)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (ok (var-set emergency-withdraw-enabled true))
+  )
+)
+
+(define-public (set-reward-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate MAX_REWARD_RATE) ERR_INVALID_REWARD_RATE)
+    (ok (var-set reward-rate new-rate))
+  )
+)
+
+(define-public (set-min-stake-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_REWARD_RATE)
+    (ok (var-set min-stake-period new-period))
+  )
+)
+
+(define-public (set-protocol-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate u1000) ERR_INVALID_REWARD_RATE) ;; Maximum 10%
+    (ok (var-set protocol-fee-rate new-rate))
+  )
+)
+
+(define-public (withdraw-protocol-fees (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= amount (var-get protocol-fee-pool)) ERR_NOT_ENOUGH_REWARDS)
+    (var-set protocol-fee-pool (- (var-get protocol-fee-pool) amount))
+    (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount (as-contract tx-sender) tx-sender none
+    )))
+    (ok true)
+  )
+)
+
+;; LIQUIDITY MANAGEMENT
+
+(define-public (add-to-reward-pool (amount uint))
+  (begin
+    (asserts! (> amount u0) ERR_ZERO_STAKE)
+    (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+      transfer amount tx-sender (as-contract tx-sender) none
+    ))
+    (var-set reward-pool (+ (var-get reward-pool) amount))
+    (ok true)
+  )
+)
+
+;; UTILITY FUNCTIONS
+
+;; Determine user tier based on stake amount and duration
+(define-private (get-user-tier
+    (staker principal)
+    (amount uint)
+    (duration uint)
+  )
+  (let ((stake-info (map-get? stakes { staker: staker })))
+    (if (>= amount u1000000000)
+      (if (>= duration u17280)
+        u4
+        u3
+      )
+      (if (>= amount u100000000)
+        (if (>= duration u8640)
+          u3
+          u2
+        )
+        (if (>= amount u10000000)
+          (if (>= duration u4320)
+            u2
+            u1
+          )
+          u1
+        )
+      )
+    )
+  )
+)
+
+;; Calculate loyalty bonus based on user engagement
+(define-private (calculate-loyalty-bonus (staker principal))
+  (match (map-get? user-stats { user: staker })
+    stats (let ((loyalty-points (get loyalty-points stats)))
+      (if (> loyalty-points u1000)
+        u200 ;; 2% bonus for whales
+        (if (> loyalty-points u500)
+          u100 ;; 1% bonus for veterans
+          (if (> loyalty-points u100)
+            u50 ;; 0.5% bonus for regulars
+            u0
+          )
+        )
+      )
+    )
+    u0
+  )
+)
+
+;; Update user statistics and loyalty tracking
+(define-private (update-user-stats
+    (staker principal)
+    (amount uint)
+  )
+  (match (map-get? user-stats { user: staker })
+    prev-stats (map-set user-stats { user: staker } {
+      total-staked-ever: (+ (get total-staked-ever prev-stats) amount),
+      stake-count: (+ (get stake-count prev-stats) u1),
+      first-stake-block: (get first-stake-block prev-stats),
+      loyalty-points: (+ (get loyalty-points prev-stats) (/ amount u1000000)),
+    })
+    (map-set user-stats { user: staker } {
+      total-staked-ever: amount,
+      stake-count: u1,
+      first-stake-block: stacks-block-height,
+      loyalty-points: (/ amount u1000000),
+    })
+  )
+)
 
 ;; CORE STAKING MECHANICS
 
@@ -188,6 +349,114 @@
     ;; Update protocol metrics
     (var-set total-staked (+ (var-get total-staked) amount))
     (update-user-stats tx-sender amount)
+    (ok true)
+  )
+)
+
+;; REWARD CALCULATION ENGINE
+
+(define-read-only (calculate-rewards (staker principal))
+  (match (map-get? stakes { staker: staker })
+    stake-info (let (
+        (stake-amount (get amount stake-info))
+        (stake-duration (- stacks-block-height (get last-reward-claim stake-info)))
+        (user-tier (get tier stake-info))
+        (tier-info (unwrap! (map-get? reward-tiers { tier: user-tier }) u0))
+        (tier-multiplier (get reward-multiplier tier-info))
+        (base-reward (/ (* stake-amount (var-get reward-rate)) BASIS_POINTS))
+        (time-factor (/ stake-duration BLOCKS_PER_YEAR))
+        (tier-bonus (/ (* base-reward tier-multiplier) BASIS_POINTS))
+        (loyalty-bonus-rate (calculate-loyalty-bonus staker))
+        (loyalty-bonus (/ (* tier-bonus loyalty-bonus-rate) BASIS_POINTS))
+        (compound-bonus (if (get auto-compound stake-info)
+          (/ (* tier-bonus (var-get compound-bonus-rate)) BASIS_POINTS)
+          u0
+        ))
+        (total-reward (+ tier-bonus loyalty-bonus compound-bonus))
+      )
+      (/ (* total-reward time-factor) u1)
+    )
+    u0
+  )
+)
+
+;; REWARD DISTRIBUTION
+
+(define-public (claim-rewards)
+  (let (
+      (stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND))
+      (reward-amount (calculate-rewards tx-sender))
+    )
+    ;; Validate claim conditions
+    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+    (asserts! (> reward-amount u0) ERR_NO_STAKE_FOUND)
+    (asserts! (<= reward-amount (var-get reward-pool)) ERR_NOT_ENOUGH_REWARDS)
+    ;; Process protocol fees
+    (let (
+        (protocol-fee (/ (* reward-amount (var-get protocol-fee-rate)) BASIS_POINTS))
+        (net-reward (- reward-amount protocol-fee))
+      )
+      ;; Update protocol accounting
+      (var-set reward-pool (- (var-get reward-pool) reward-amount))
+      (var-set protocol-fee-pool (+ (var-get protocol-fee-pool) protocol-fee))
+      (var-set total-rewards-distributed
+        (+ (var-get total-rewards-distributed) reward-amount)
+      )
+      ;; Handle reward distribution based on auto-compound preference
+      (if (get auto-compound stake-info)
+        (begin
+          ;; Compound rewards into stake position
+          (map-set stakes { staker: tx-sender } {
+            amount: (+ (get amount stake-info) net-reward),
+            staked-at: (get staked-at stake-info),
+            last-reward-claim: stacks-block-height,
+            tier: (get tier stake-info),
+            auto-compound: true,
+          })
+          ;; Update compound tracking
+          (match (map-get? rewards-claimed { staker: tx-sender })
+            prev-claimed (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: (get total-claimed prev-claimed),
+              last-claim-block: stacks-block-height,
+              compound-rewards: (+ (get compound-rewards prev-claimed) net-reward),
+            })
+            (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: u0,
+              last-claim-block: stacks-block-height,
+              compound-rewards: net-reward,
+            })
+          )
+          (var-set total-staked (+ (var-get total-staked) net-reward))
+        )
+        (begin
+          ;; Direct reward payment to staker
+          (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
+            transfer net-reward (as-contract tx-sender) tx-sender none
+          )))
+          ;; Reset reward accumulation
+          (map-set stakes { staker: tx-sender } {
+            amount: (get amount stake-info),
+            staked-at: (get staked-at stake-info),
+            last-reward-claim: stacks-block-height,
+            tier: (get tier stake-info),
+            auto-compound: false,
+          })
+          ;; Update claim history
+          (match (map-get? rewards-claimed { staker: tx-sender })
+            prev-claimed (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: (+ (get total-claimed prev-claimed) net-reward),
+              last-claim-block: stacks-block-height,
+              compound-rewards: (get compound-rewards prev-claimed),
+            })
+            (map-set rewards-claimed { staker: tx-sender } {
+              total-claimed: net-reward,
+              last-claim-block: stacks-block-height,
+              compound-rewards: u0,
+            })
+          )
+        )
+      )
+    )
     (ok true)
   )
 )
@@ -276,170 +545,10 @@
   )
 )
 
-;; REWARD DISTRIBUTION
-
-(define-public (claim-rewards)
-  (let (
-      (stake-info (unwrap! (map-get? stakes { staker: tx-sender }) ERR_NO_STAKE_FOUND))
-      (reward-amount (calculate-rewards tx-sender))
-    )
-    ;; Validate claim conditions
-    (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-    (asserts! (> reward-amount u0) ERR_NO_STAKE_FOUND)
-    (asserts! (<= reward-amount (var-get reward-pool)) ERR_NOT_ENOUGH_REWARDS)
-    ;; Process protocol fees
-    (let (
-        (protocol-fee (/ (* reward-amount (var-get protocol-fee-rate)) BASIS_POINTS))
-        (net-reward (- reward-amount protocol-fee))
-      )
-      ;; Update protocol accounting
-      (var-set reward-pool (- (var-get reward-pool) reward-amount))
-      (var-set protocol-fee-pool (+ (var-get protocol-fee-pool) protocol-fee))
-      (var-set total-rewards-distributed
-        (+ (var-get total-rewards-distributed) reward-amount)
-      )
-      ;; Handle reward distribution based on auto-compound preference
-      (if (get auto-compound stake-info)
-        (begin
-          ;; Compound rewards into stake position
-          (map-set stakes { staker: tx-sender } {
-            amount: (+ (get amount stake-info) net-reward),
-            staked-at: (get staked-at stake-info),
-            last-reward-claim: stacks-block-height,
-            tier: (get tier stake-info),
-            auto-compound: true,
-          })
-          ;; Update compound tracking
-          (match (map-get? rewards-claimed { staker: tx-sender })
-            prev-claimed (map-set rewards-claimed { staker: tx-sender } {
-              total-claimed: (get total-claimed prev-claimed),
-              last-claim-block: stacks-block-height,
-              compound-rewards: (+ (get compound-rewards prev-claimed) net-reward),
-            })
-            (map-set rewards-claimed { staker: tx-sender } {
-              total-claimed: u0,
-              last-claim-block: stacks-block-height,
-              compound-rewards: net-reward,
-            })
-          )
-          (var-set total-staked (+ (var-get total-staked) net-reward))
-        )
-        (begin
-          ;; Direct reward payment to staker
-          (as-contract (try! (contract-call? 'ST1F7QA2MDF17S807EPA36TSS8AMEFY4KA9TVGWXT.sbtc-token
-            transfer net-reward (as-contract tx-sender) tx-sender none
-          )))
-          ;; Reset reward accumulation
-          (map-set stakes { staker: tx-sender } {
-            amount: (get amount stake-info),
-            staked-at: (get staked-at stake-info),
-            last-reward-claim: stacks-block-height,
-            tier: (get tier stake-info),
-            auto-compound: false,
-          })
-          ;; Update claim history
-          (match (map-get? rewards-claimed { staker: tx-sender })
-            prev-claimed (map-set rewards-claimed { staker: tx-sender } {
-              total-claimed: (+ (get total-claimed prev-claimed) net-reward),
-              last-claim-block: stacks-block-height,
-              compound-rewards: (get compound-rewards prev-claimed),
-            })
-            (map-set rewards-claimed { staker: tx-sender } {
-              total-claimed: net-reward,
-              last-claim-block: stacks-block-height,
-              compound-rewards: u0,
-            })
-          )
-        )
-      )
-    )
-    (ok true)
-  )
-)
-
-;; UTILITY FUNCTIONS
-
-;; Determine user tier based on stake amount and duration
-(define-private (get-user-tier
-    (staker principal)
-    (amount uint)
-    (duration uint)
-  )
-  (let ((stake-info (map-get? stakes { staker: staker })))
-    (if (>= amount u1000000000)
-      (if (>= duration u17280)
-        u4
-        u3
-      )
-      (if (>= amount u100000000)
-        (if (>= duration u8640)
-          u3
-          u2
-        )
-        (if (>= amount u10000000)
-          (if (>= duration u4320)
-            u2
-            u1
-          )
-          u1
-        )
-      )
-    )
-  )
-)
-
-;; Calculate loyalty bonus based on user engagement
-(define-private (calculate-loyalty-bonus (staker principal))
-  (match (map-get? user-stats { user: staker })
-    stats (let ((loyalty-points (get loyalty-points stats)))
-      (if (> loyalty-points u1000)
-        u200 ;; 2% bonus for whales
-        (if (> loyalty-points u500)
-          u100 ;; 1% bonus for veterans
-          (if (> loyalty-points u100)
-            u50 ;; 0.5% bonus for regulars
-            u0
-          )
-        )
-      )
-    )
-    u0
-  )
-)
-
-;; Update user statistics and loyalty tracking
-(define-private (update-user-stats
-    (staker principal)
-    (amount uint)
-  )
-  (match (map-get? user-stats { user: staker })
-    prev-stats (map-set user-stats { user: staker } {
-      total-staked-ever: (+ (get total-staked-ever prev-stats) amount),
-      stake-count: (+ (get stake-count prev-stats) u1),
-      first-stake-block: (get first-stake-block prev-stats),
-      loyalty-points: (+ (get loyalty-points prev-stats) (/ amount u1000000)),
-    })
-    (map-set user-stats { user: staker } {
-      total-staked-ever: amount,
-      stake-count: u1,
-      first-stake-block: stacks-block-height,
-      loyalty-points: (/ amount u1000000),
-    })
-  )
-)
-
 ;; QUERY INTERFACE
 
 (define-read-only (get-stake-info (staker principal))
   (map-get? stakes { staker: staker })
-)
-
-(define-read-only (get-total-staked)
-  (var-get total-staked)
-)
-
-(define-read-only (get-min-stake-period)
-  (var-get min-stake-period)
 )
 
 (define-read-only (get-rewards-claimed (staker principal))
@@ -454,104 +563,38 @@
   (map-get? reward-tiers { tier: tier })
 )
 
+(define-read-only (get-contract-stats)
+  {
+    total-staked: (var-get total-staked),
+    reward-pool: (var-get reward-pool),
+    total-rewards-distributed: (var-get total-rewards-distributed),
+    protocol-fee-pool: (var-get protocol-fee-pool),
+    reward-rate: (var-get reward-rate),
+    is-paused: (var-get contract-paused),
+    emergency-enabled: (var-get emergency-withdraw-enabled),
+  }
+)
+
 (define-read-only (get-reward-rate)
   (var-get reward-rate)
+)
+
+(define-read-only (get-min-stake-period)
+  (var-get min-stake-period)
 )
 
 (define-read-only (get-reward-pool)
   (var-get reward-pool)
 )
 
+(define-read-only (get-total-staked)
+  (var-get total-staked)
+)
+
 (define-read-only (get-current-apy)
   (let ((base-rate (var-get reward-rate)))
     (/ (* base-rate u100) u100)
     ;; Convert basis points to percentage
-  )
-)
-
-;; ADMINISTRATIVE FUNCTIONS
-
-(define-read-only (get-contract-owner)
-  (var-get contract-owner)
-)
-
-(define-public (set-contract-owner (new-owner principal))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
-    (asserts! (not (is-eq new-owner (var-get contract-owner))) (ok true))
-    (ok (var-set contract-owner new-owner))
-  )
-)
-
-(define-public (pause-contract)
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
-    (ok (var-set contract-paused true))
-  )
-)
-
-(define-public (unpause-contract)
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
-    (ok (var-set contract-paused false))
-  )
-)
-
-(define-public (enable-emergency-withdraw)
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
-    (ok (var-set emergency-withdraw-enabled true))
-  )
-)
-
-(define-public (set-reward-rate (new-rate uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
-    (asserts! (<= new-rate u2000) ERR_INVALID_REWARD_RATE) ;; Max 20% APY
-    (ok (var-set reward-rate new-rate))
-  )
-)
-
-(define-public (set-min-stake-period (new-period uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
-    (asserts! (> new-period u0) ERR_INVALID_REWARD_RATE)
-    (ok (var-set min-stake-period new-period))
-  )
-)
-
-(define-public (set-protocol-fee-rate (new-rate uint))
-  (begin
-    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
-    (asserts! (<= new-rate u1000) ERR_INVALID_REWARD_RATE) ;; Maximum 10%
-    (ok (var-set protocol-fee-rate new-rate))
-  )
-)
-
-;; REWARD CALCULATION ENGINE
-
-(define-read-only (calculate-rewards (staker principal))
-  (match (map-get? stakes { staker: staker })
-    stake-info (let (
-        (stake-amount (get amount stake-info))
-        (stake-duration (- stacks-block-height (get last-reward-claim stake-info)))
-        (user-tier (get tier stake-info))
-        (tier-info (unwrap! (map-get? reward-tiers { tier: user-tier }) u0))
-        (tier-multiplier (get reward-multiplier tier-info))
-        (base-reward (/ (* stake-amount (var-get reward-rate)) BASIS_POINTS))
-        (time-factor (/ stake-duration BLOCKS_PER_YEAR))
-        (tier-bonus (/ (* base-reward tier-multiplier) BASIS_POINTS))
-        (loyalty-bonus-rate (calculate-loyalty-bonus staker))
-        (loyalty-bonus (/ (* tier-bonus loyalty-bonus-rate) BASIS_POINTS))
-        (compound-bonus (if (get auto-compound stake-info)
-          (/ (* tier-bonus (var-get compound-bonus-rate)) BASIS_POINTS)
-          u0
-        ))
-        (total-reward (+ tier-bonus loyalty-bonus compound-bonus))
-      )
-      (/ (* total-reward time-factor) u1)
-    )
-    u0
   )
 )
 
@@ -577,5 +620,25 @@
       (/ (* tier-bonus time-factor) u1)
     )
     u0
+  )
+)
+
+;; PROTOCOL HEALTH MONITORING
+
+(define-read-only (contract-health-check)
+  (let (
+      (reward-pool-balance (var-get reward-pool))
+      (total-staked-amount (var-get total-staked))
+      (reward-ratio (if (> total-staked-amount u0)
+        (/ (* reward-pool-balance u100) total-staked-amount)
+        u0
+      ))
+    )
+    {
+      reward-pool-ratio: reward-ratio,
+      is-healthy: (> reward-ratio u10), ;; Healthy: 10%+ reserve ratio
+      contract-version: CONTRACT_VERSION,
+      protocol-status: "operational",
+    }
   )
 )
