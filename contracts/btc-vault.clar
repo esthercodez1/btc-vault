@@ -475,6 +475,59 @@
   (var-get contract-owner)
 )
 
+(define-public (set-contract-owner (new-owner principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq new-owner (var-get contract-owner))) (ok true))
+    (ok (var-set contract-owner new-owner))
+  )
+)
+
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (ok (var-set contract-paused true))
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (ok (var-set contract-paused false))
+  )
+)
+
+(define-public (enable-emergency-withdraw)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (ok (var-set emergency-withdraw-enabled true))
+  )
+)
+
+(define-public (set-reward-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate u2000) ERR_INVALID_REWARD_RATE) ;; Max 20% APY
+    (ok (var-set reward-rate new-rate))
+  )
+)
+
+(define-public (set-min-stake-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-period u0) ERR_INVALID_REWARD_RATE)
+    (ok (var-set min-stake-period new-period))
+  )
+)
+
+(define-public (set-protocol-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate u1000) ERR_INVALID_REWARD_RATE) ;; Maximum 10%
+    (ok (var-set protocol-fee-rate new-rate))
+  )
+)
+
 ;; REWARD CALCULATION ENGINE
 
 (define-read-only (calculate-rewards (staker principal))
