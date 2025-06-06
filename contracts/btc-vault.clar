@@ -21,6 +21,8 @@
 
 (define-constant CONTRACT_VERSION u1)
 (define-constant BLOCKS_PER_DAY u144)
+(define-constant BLOCKS_PER_YEAR u52560)
+(define-constant BASIS_POINTS u10000)
 (define-constant MIN_STAKE_AMOUNT u1000000) ;; 0.01 sBTC minimum threshold
 
 ;; ERROR DEFINITIONS
@@ -36,6 +38,8 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u108))
 (define-constant ERR_TRANSFER_FAILED (err u109))
 (define-constant ERR_COOLDOWN_PERIOD (err u110))
+(define-constant ERR_TIER_NOT_FOUND (err u111))
+(define-constant ERR_INVALID_TIER (err u112))
 
 ;; DATA STRUCTURES
 
@@ -51,12 +55,80 @@
   }
 )
 
+;; Reward tracking and history
+(define-map rewards-claimed
+  { staker: principal }
+  {
+    total-claimed: uint,
+    last-claim-block: uint,
+    compound-rewards: uint,
+  }
+)
+
+;; Tier-based reward system configuration
+(define-map reward-tiers
+  { tier: uint }
+  {
+    min-amount: uint,
+    min-duration: uint,
+    reward-multiplier: uint,
+    name: (string-ascii 20),
+  }
+)
+
+;; User engagement and loyalty metrics
+(define-map user-stats
+  { user: principal }
+  {
+    total-staked-ever: uint,
+    stake-count: uint,
+    first-stake-block: uint,
+    loyalty-points: uint,
+  }
+)
+
+;; TIER SYSTEM INITIALIZATION
+
+;; Bronze Tier - Entry Level
+(map-set reward-tiers { tier: u1 } {
+  min-amount: u1000000, ;; 0.01 sBTC
+  min-duration: u1440, ;; 10 days
+  reward-multiplier: u10000, ;; 1x base rate
+  name: "Bronze",
+}) 
+
+;; Silver Tier - Committed Stakers
+(map-set reward-tiers { tier: u2 } {
+  min-amount: u10000000, ;; 0.1 sBTC
+  min-duration: u4320, ;; 30 days
+  reward-multiplier: u12000, ;; 1.2x boost
+  name: "Silver",
+}) 
+
+;; Gold Tier - Serious Investors
+(map-set reward-tiers { tier: u3 } {
+  min-amount: u100000000, ;; 1 sBTC
+  min-duration: u8640, ;; 60 days
+  reward-multiplier: u15000, ;; 1.5x boost
+  name: "Gold",
+}) 
+
+;; Platinum Tier - Whale Investors
+(map-set reward-tiers { tier: u4 } {
+  min-amount: u1000000000, ;; 10 sBTC
+  min-duration: u17280, ;; 120 days
+  reward-multiplier: u20000, ;; 2x boost
+  name: "Platinum",
+})
+
 ;; PROTOCOL STATE VARIABLES
 
 ;; Core governance and configuration
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-stake-period uint u1440) ;; ~10 days minimum lock
 (define-data-var total-staked uint u0)
+(define-data-var reward-rate uint u500) ;; 5% base annual rate
+(define-data-var reward-pool uint u0)
 
 ;; Security and emergency controls
 (define-data-var contract-paused bool false)
@@ -64,6 +136,10 @@
 (define-data-var cooldown-period uint u144) ;; 1 day cooldown
 
 ;; Economic parameters
+(define-data-var total-rewards-distributed uint u0)
+(define-data-var protocol-fee-rate uint u100) ;; 1% protocol fee
+(define-data-var protocol-fee-pool uint u0)
+(define-data-var compound-bonus-rate uint u50) ;; 0.5% auto-compound bonus
 (define-data-var max-individual-stake uint u100000000000) ;; 1000 sBTC per user limit
 
 ;; CORE STAKING MECHANICS
@@ -201,6 +277,37 @@
       auto-compound: (not (get auto-compound stake-info)),
     })
     (ok (not (get auto-compound stake-info)))
+  )
+)
+
+;; UTILITY FUNCTIONS
+
+;; Determine user tier based on stake amount and duration
+(define-private (get-user-tier
+    (staker principal)
+    (amount uint)
+    (duration uint)
+  )
+  (let ((stake-info (map-get? stakes { staker: staker })))
+    (if (>= amount u1000000000)
+      (if (>= duration u17280)
+        u4
+        u3
+      )
+      (if (>= amount u100000000)
+        (if (>= duration u8640)
+          u3
+          u2
+        )
+        (if (>= amount u10000000)
+          (if (>= duration u4320)
+            u2
+            u1
+          )
+          u1
+        )
+      )
+    )
   )
 )
 
